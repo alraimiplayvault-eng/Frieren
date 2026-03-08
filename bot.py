@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # ==============================
 
 load_dotenv()
-TOKEN = "MTQ3OTgwMTk5OTIwNDY4MzgzNg.GlIL2i.Fzm-arA3-6m1tpxAi2y7fhMrnriurQsP831ZWo"
+TOKEN = os.getenv("TOKKEN")
 
 # ==============================
 # إعدادات
@@ -1156,5 +1156,6 @@ async def on_member_join(member):
             )
         )
 bot.run(TOKEN)
+
 
 
