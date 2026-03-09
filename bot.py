@@ -22,6 +22,7 @@ QUESTION_TIME = 20
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix=["!", ".", "-"], intents=intents)
 
@@ -1156,6 +1157,7 @@ async def on_member_join(member):
             )
         )
 bot.run(TOKEN)
+
 
 
 
