@@ -1,3 +1,4 @@
+import io
 import os
 import random
 import asyncio
@@ -934,6 +935,10 @@ class GameView(discord.ui.View):
 
         channel = interaction.channel
 
+        if isinstance(sessions.get(channel.id), WordSession):
+            await interaction.response.send_message("هناك لعبة تعمل.", ephemeral=True)
+            return
+
         if channel.id not in sessions:
             session = GameSession(channel)
             sessions[channel.id] = session
@@ -943,6 +948,17 @@ class GameView(discord.ui.View):
         await interaction.response.send_message("حسنًا... لنرَ هذا اللغز.")
 
         await start_riddle(session)
+
+    @discord.ui.button(label="حزر الكلمة", style=discord.ButtonStyle.success)
+    async def word_game(self, interaction: discord.Interaction, button):
+
+        channel = interaction.channel
+
+        if channel.id in sessions:
+            await interaction.response.send_message("هناك لعبة تعمل.", ephemeral=True)
+            return
+
+        await wordgame_open_lobby(channel, interaction.user, interaction)
 
 # =========================
 # دوال الأحجيات
@@ -1088,6 +1104,10 @@ async def on_message(message):
 
     session=sessions.get(message.channel.id)
 
+    if isinstance(session, WordSession):
+        if await wordgame_on_message(session, message):
+            return
+
     if session and session.answers:
 
         if message.author.id in session.players:
@@ -1124,6 +1144,528 @@ async def on_message(message):
             )
             return
     await bot.process_commands(message)
+
+# ==============================
+# لعبة حزر الكلمة
+# ==============================
+# صاحب كلمة يكتب كلمة سرية وتلميحًا، والسائلون المنضمون يتناوبون
+# على الأسئلة (20 سؤالًا مشتركًا)، وصاحب الكلمة لا يجيب إلا بـ:
+# نعم / لا / ممكن / لا أعلم — عبر أزرار.
+# في دور السائل: إما أن يسأل، أو يخمّن الكلمة (التخمين الخاطئ يضيّع دوره).
+# الفائز يخمّن الكلمة، أو صاحب الكلمة إذا صمدت كلمته 20 سؤالًا.
+
+WORDGAME_QUESTIONS = 20           # عدد الأسئلة المشتركة
+WORDGAME_JOIN_TIME = 30           # مدة الانضمام للسائلين
+WORDGAME_TURN_TIMEOUT = 90        # مهلة السائل قبل تخطي دوره (ثانية)
+WORDGAME_ANSWER_TIMEOUT = 120     # مهلة صاحب الكلمة للإجابة (ثانية)
+WORDGAME_SETUP_TIMEOUT = 180      # مهلة صاحب الكلمة لكتابة الكلمة (ثانية)
+WORDGAME_KEEPER_MAX_TIMEOUTS = 3  # غياب صاحب الكلمة 3 مرات ينهي الجولة
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WINNER_BASE_IMAGE = os.path.join(BASE_DIR, "assets", "winner_base.png")
+WINNER_FONT_BOLD = os.path.join(BASE_DIR, "assets", "NotoNaskhArabic-Bold.ttf")
+WINNER_FONT_REGULAR = os.path.join(BASE_DIR, "assets", "NotoNaskhArabic-Regular.ttf")
+
+
+def normalize_ar(text):
+    """تطبيع خفيف للنص العربي لمقارنة التخمين بالكلمة."""
+    text = (text or "").strip()
+    for a, b in [("أ", "ا"), ("إ", "ا"), ("آ", "ا"), ("ة", "ه"),
+                 ("ى", "ي"), ("ئ", "ي"), ("ؤ", "و"), ("ـ", "")]:
+        text = text.replace(a, b)
+    return " ".join(text.split()).lower()
+
+
+def render_winner_card(title, name, line1, line2):
+    """يرسم بطاقة الفائز على صفحة الكتاب المفتوحة ويرجع BytesIO بصيغة PNG."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.open(WINNER_BASE_IMAGE).convert("RGB")
+    W, H = img.size
+    d = ImageDraw.Draw(img)
+    ink = (74, 50, 32)
+
+    def make_font(path, size):
+        return ImageFont.truetype(path, size, layout_engine=ImageFont.Layout.RAQM)
+
+    def center(text, y, size, bold=True):
+        if not text:
+            return
+        path = WINNER_FONT_BOLD if bold else WINNER_FONT_REGULAR
+        f = make_font(path, size)
+        while size > 20:
+            box = d.textbbox((0, 0), text, font=f, direction="rtl", language="ar")
+            if box[2] - box[0] <= W * 0.82:
+                break
+            size -= 6
+            f = make_font(path, size)
+        box = d.textbbox((0, 0), text, font=f, direction="rtl", language="ar")
+        x = (W - (box[2] - box[0])) // 2 - box[0]
+        d.text((x, y), text, font=f, fill=ink, direction="rtl", language="ar")
+
+    center(title, int(H * 0.615), int(W * 0.052))
+    center(name, int(H * 0.695), int(W * 0.075))
+    center(line1, int(H * 0.815), int(W * 0.038), bold=False)
+    center(line2, int(H * 0.878), int(W * 0.038), bold=False)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+class WordSession:
+    """جلسة لعبة حزر الكلمة في قناة واحدة."""
+
+    def __init__(self, channel, keeper):
+        self.channel = channel
+        self.keeper = keeper
+        self.players = {}            # السائلون {id: user} بترتيب الانضمام
+        self.phase = "lobby"         # lobby -> setup -> playing -> done
+        # سمات توافق مع بقية الألعاب حتى لا تتعطل on_message العامة
+        self.answers = []
+        self.scores = {}
+        self.riddle_active = False
+        self.riddle_answers = []
+        self.riddle_timeout_task = None
+        # حالة لعبة الكلمة
+        self.word = None
+        self.hint = None
+        self.category = None
+        self.word_event = asyncio.Event()
+        self.questions_left = WORDGAME_QUESTIONS
+        self.questions_used = 0
+        self.turn_order = []
+        self.turn_idx = 0
+        self.turn_no = 0
+        self.awaiting = None         # None | "question" | "answer"
+        self.pending_question = None
+        self.pending_view = None
+        self.turn_task = None
+        self.answer_task = None
+        self.keeper_timeouts = 0
+        self.lobby_msg = None
+        self.lobby_view = None
+
+    def current_asker_id(self):
+        if not self.turn_order:
+            return None
+        return self.turn_order[self.turn_idx % len(self.turn_order)]
+
+
+class WordSetupModal(discord.ui.Modal, title="الكلمة السرية"):
+    """نافذة خاصة بصاحب الكلمة: الكلمة لا تظهر في القناة أبدًا."""
+
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+        self.word_input = discord.ui.TextInput(label="الكلمة", max_length=40)
+        self.hint_input = discord.ui.TextInput(label="التلميح", max_length=150)
+        self.category_input = discord.ui.TextInput(
+            label="التصنيف (اختياري)", required=False, max_length=30
+        )
+        self.add_item(self.word_input)
+        self.add_item(self.hint_input)
+        self.add_item(self.category_input)
+
+    async def on_submit(self, interaction):
+        s = self.session
+        s.word = self.word_input.value.strip()
+        s.hint = self.hint_input.value.strip()
+        s.category = self.category_input.value.strip() or None
+        s.word_event.set()
+        await interaction.response.send_message(
+            "انحفظت الكلمة سرًا. تبدأ اللعبة بعد إغلاق الانضمام.", ephemeral=True
+        )
+
+
+class WordGuessModal(discord.ui.Modal, title="تخمين الكلمة"):
+
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+        self.guess_input = discord.ui.TextInput(label="الكلمة هي", max_length=40)
+        self.add_item(self.guess_input)
+
+    async def on_submit(self, interaction):
+        s = self.session
+        if s.phase != "playing" or s.awaiting != "question":
+            await interaction.response.send_message("انتهى دورك.", ephemeral=True)
+            return
+        if interaction.user.id != s.current_asker_id():
+            await interaction.response.send_message("مو دورك.", ephemeral=True)
+            return
+
+        guess = self.guess_input.value.strip()
+        if normalize_ar(guess) == normalize_ar(s.word):
+            await interaction.response.send_message(
+                f"🎯 {interaction.user.mention} خمّنها: **{s.word}**"
+            )
+            await wordgame_end(s, winner=interaction.user)
+        else:
+            await interaction.response.send_message(
+                f"تخمين خاطئ من {interaction.user.mention}... تضيّع دوره."
+            )
+            if s.turn_task:
+                s.turn_task.cancel()
+            s.turn_idx += 1
+            s.turn_no += 1
+            await wordgame_next_turn(s)
+
+
+class WordLobbyView(discord.ui.View):
+    """أزرار اللوبي: انضمام السائلين + كتابة الكلمة لصاحبها."""
+
+    def __init__(self, session):
+        super().__init__(timeout=None)
+        self.session = session
+
+    @discord.ui.button(label="انضمام", style=discord.ButtonStyle.primary)
+    async def join(self, interaction, button):
+        s = self.session
+        if s.phase != "lobby":
+            await interaction.response.send_message("أُغلق الانضمام.", ephemeral=True)
+            return
+        if interaction.user.id == s.keeper.id:
+            await interaction.response.send_message(
+                "أنت صاحب الكلمة، ما تنضم كسائل.", ephemeral=True
+            )
+            return
+        s.players[interaction.user.id] = interaction.user
+        await interaction.response.send_message("تم تسجيلك كسائل.", ephemeral=True)
+
+    @discord.ui.button(label="اكتب الكلمة والتلميح", style=discord.ButtonStyle.secondary)
+    async def setup(self, interaction, button):
+        if interaction.user.id != self.session.keeper.id:
+            await interaction.response.send_message(
+                "ذا الزر لصاحب الكلمة فقط.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(WordSetupModal(self.session))
+
+
+class WordTurnView(discord.ui.View):
+    """زر التخمين في رسالة الدور — صالح لدوره فقط."""
+
+    def __init__(self, session):
+        super().__init__(timeout=WORDGAME_TURN_TIMEOUT + 60)
+        self.session = session
+        self.turn_no = session.turn_no
+
+    @discord.ui.button(label="🎯 خمّن الكلمة", style=discord.ButtonStyle.success)
+    async def guess(self, interaction, button):
+        s = self.session
+        if (
+            s.phase != "playing"
+            or s.awaiting != "question"
+            or self.turn_no != s.turn_no
+            or interaction.user.id != s.current_asker_id()
+        ):
+            await interaction.response.send_message("مو دورك.", ephemeral=True)
+            return
+        await interaction.response.send_modal(WordGuessModal(s))
+
+
+class WordAnswerView(discord.ui.View):
+    """أزرار إجابة صاحب الكلمة: نعم / لا / ممكن / لا أعلم."""
+
+    def __init__(self, session):
+        super().__init__(timeout=WORDGAME_ANSWER_TIMEOUT + 30)
+        self.session = session
+        self.turn_no = session.turn_no
+
+    async def _answer(self, interaction, label):
+        s = self.session
+        if interaction.user.id != s.keeper.id:
+            await interaction.response.send_message(
+                "الأزرار لصاحب الكلمة فقط.", ephemeral=True
+            )
+            return
+        if s.phase != "playing" or s.awaiting != "answer" or self.turn_no != s.turn_no:
+            await interaction.response.send_message("انتهى وقت ذا السؤال.", ephemeral=True)
+            return
+
+        s.awaiting = None
+        if s.answer_task:
+            s.answer_task.cancel()
+        self.stop()
+
+        asker = s.players[s.current_asker_id()]
+        await interaction.response.edit_message(
+            content=(
+                f"سؤال {asker.mention}: {s.pending_question}\n"
+                f"الجواب: **{label}** — تبقّى {s.questions_left} سؤالًا."
+            ),
+            view=None,
+        )
+
+        if s.questions_left <= 0:
+            await wordgame_end(s, keeper_won=True)
+            return
+
+        s.turn_idx += 1
+        s.turn_no += 1
+        await wordgame_next_turn(s)
+
+    @discord.ui.button(label="نعم", style=discord.ButtonStyle.success)
+    async def yes(self, interaction, button):
+        await self._answer(interaction, "نعم")
+
+    @discord.ui.button(label="لا", style=discord.ButtonStyle.danger)
+    async def no(self, interaction, button):
+        await self._answer(interaction, "لا")
+
+    @discord.ui.button(label="ممكن", style=discord.ButtonStyle.primary)
+    async def maybe(self, interaction, button):
+        await self._answer(interaction, "ممكن")
+
+    @discord.ui.button(label="لا أعلم", style=discord.ButtonStyle.secondary)
+    async def dont_know(self, interaction, button):
+        await self._answer(interaction, "لا أعلم")
+
+
+class WordRematchView(discord.ui.View):
+    """زر جولة جديدة — صاحب الكلمة التالي هو فائز الجولة الماضية."""
+
+    def __init__(self, channel, next_keeper):
+        super().__init__(timeout=300)
+        self.channel = channel
+        self.next_keeper = next_keeper
+
+    @discord.ui.button(label="جولة جديدة", style=discord.ButtonStyle.primary)
+    async def rematch(self, interaction, button):
+        if self.channel.id in sessions:
+            await interaction.response.send_message("هناك لعبة تعمل.", ephemeral=True)
+            return
+        self.stop()
+        await wordgame_open_lobby(self.channel, self.next_keeper, interaction)
+
+
+async def wordgame_open_lobby(channel, keeper, interaction=None):
+    session = WordSession(channel, keeper)
+    sessions[channel.id] = session
+    view = WordLobbyView(session)
+    session.lobby_view = view
+    text = (
+        "لعبة **حزر الكلمة**!\n"
+        f"{keeper.mention} هو صاحب الكلمة.\n"
+        "اضغط «انضمام» لتكون من السائلين — الأسئلة بالدور، والمجموع "
+        f"{WORDGAME_QUESTIONS} سؤالًا مشتركًا.\n"
+        "صاحب الكلمة: اضغط «اكتب الكلمة والتلميح» واكتبها سرًا."
+    )
+    if interaction is not None:
+        await interaction.response.send_message(text, view=view)
+        session.lobby_msg = await interaction.original_response()
+    else:
+        session.lobby_msg = await channel.send(text, view=view)
+    asyncio.create_task(wordgame_lobby(session))
+
+
+async def wordgame_lobby(session):
+    channel = session.channel
+    await asyncio.sleep(WORDGAME_JOIN_TIME)
+
+    if sessions.get(channel.id) is not session or session.phase != "lobby":
+        return
+
+    if len(session.players) == 0:
+        await channel.send("لا أحد انضم... أُلغيت لعبة حزر الكلمة.")
+        await wordgame_cleanup(session)
+        return
+
+    session.phase = "setup"
+    session.turn_order = list(session.players.keys())
+
+    if not session.word:
+        await channel.send(
+            f"أُغلق الانضمام ({len(session.players)} من السائلين). "
+            f"{session.keeper.mention} اكتب الكلمة والتلميح من زر القائمة."
+        )
+        try:
+            await asyncio.wait_for(
+                session.word_event.wait(), timeout=WORDGAME_SETUP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            await channel.send("لم تُكتب الكلمة في الوقت... أُلغيت الجولة.")
+            await wordgame_cleanup(session)
+            return
+
+    await wordgame_start(session)
+
+
+async def wordgame_start(session):
+    session.phase = "playing"
+    channel = session.channel
+
+    if session.lobby_msg:
+        try:
+            await session.lobby_msg.edit(view=None)
+        except Exception:
+            pass
+
+    cat = f"\nالتصنيف: {session.category}" if session.category else ""
+    await channel.send(
+        "بدأت لعبة **حزر الكلمة**!\n"
+        f"التلميح: {session.hint}{cat}\n"
+        f"عندكم {WORDGAME_QUESTIONS} سؤالًا — وإجابات صاحب الكلمة: "
+        "نعم / لا / ممكن / لا أعلم."
+    )
+
+    session.turn_no += 1
+    await wordgame_next_turn(session)
+
+
+async def wordgame_next_turn(session):
+    if session.phase != "playing":
+        return
+    if session.questions_left <= 0:
+        await wordgame_end(session, keeper_won=True)
+        return
+
+    session.awaiting = "question"
+    asker = session.players[session.current_asker_id()]
+    await session.channel.send(
+        f"دور {asker.mention} — تبقّى {session.questions_left} سؤالًا.\n"
+        "اكتب سؤالك هنا، أو اضغط 🎯 لتخمين الكلمة (التخمين الخاطئ يضيّع دورك).",
+        view=WordTurnView(session),
+    )
+    wordgame_schedule_turn_timeout(session)
+
+
+def wordgame_schedule_turn_timeout(session):
+    if session.turn_task:
+        session.turn_task.cancel()
+    session.turn_task = asyncio.create_task(
+        wordgame_turn_timeout(session, session.turn_no)
+    )
+
+
+async def wordgame_turn_timeout(session, turn_no):
+    await asyncio.sleep(WORDGAME_TURN_TIMEOUT)
+    if (
+        session.phase != "playing"
+        or session.turn_no != turn_no
+        or session.awaiting != "question"
+    ):
+        return
+    asker = session.players[session.current_asker_id()]
+    await session.channel.send(f"انتهت مهلة {asker.mention} — ينتقل الدور.")
+    session.turn_idx += 1
+    session.turn_no += 1
+    await wordgame_next_turn(session)
+
+
+async def wordgame_answer_timeout(session, turn_no):
+    await asyncio.sleep(WORDGAME_ANSWER_TIMEOUT)
+    if (
+        session.phase != "playing"
+        or session.turn_no != turn_no
+        or session.awaiting != "answer"
+    ):
+        return
+
+    # صاحب الكلمة لم يجب: يُسترد السؤال ولا يُحتسب، وينتقل الدور
+    session.awaiting = None
+    session.questions_left += 1
+    session.questions_used -= 1
+    session.keeper_timeouts += 1
+    if session.pending_view:
+        session.pending_view.stop()
+
+    if session.keeper_timeouts >= WORDGAME_KEEPER_MAX_TIMEOUTS:
+        await session.channel.send(
+            "صاحب الكلمة غاب ثلاث مرات... أُلغيت الجولة."
+        )
+        await wordgame_cleanup(session)
+        return
+
+    await session.channel.send(
+        "صاحب الكلمة ما جاوب في الوقت — السؤال ما انحسب، وينتقل الدور."
+    )
+    session.turn_idx += 1
+    session.turn_no += 1
+    await wordgame_next_turn(session)
+
+
+async def wordgame_on_message(session, message):
+    """يستهلك رسالة السائل الحالي كسؤال. يرجع True إذا استُهلكت."""
+    if session.phase != "playing" or session.awaiting != "question":
+        return False
+    if message.author.id != session.current_asker_id():
+        return False
+
+    session.questions_left -= 1
+    session.questions_used += 1
+    session.pending_question = message.content.strip()
+    session.awaiting = "answer"
+    if session.turn_task:
+        session.turn_task.cancel()
+
+    view = WordAnswerView(session)
+    session.pending_view = view
+    await message.channel.send(
+        f"سؤال {message.author.mention}: {session.pending_question}\n"
+        f"{session.keeper.mention} أجب بأحد الأزرار.",
+        view=view,
+    )
+    session.answer_task = asyncio.create_task(
+        wordgame_answer_timeout(session, session.turn_no)
+    )
+    return True
+
+
+async def wordgame_end(session, keeper_won=False, winner=None):
+    if session.phase == "done":
+        return
+    session.phase = "done"
+    channel = session.channel
+
+    for task in (session.turn_task, session.answer_task):
+        if task:
+            task.cancel()
+
+    if keeper_won:
+        title = "صمدت الكلمة!"
+        name = session.keeper.display_name
+        line1 = f"لم تُخمَّن في {WORDGAME_QUESTIONS} سؤالًا"
+        line2 = f"الكلمة كانت: {session.word}"
+        next_keeper = (
+            session.players[session.turn_order[0]]
+            if session.turn_order
+            else session.keeper
+        )
+    else:
+        title = "الفائز"
+        name = winner.display_name
+        line1 = f"خمّن الكلمة في {session.questions_used} سؤالًا"
+        line2 = f"الكلمة: {session.word}"
+        next_keeper = winner
+
+    try:
+        buf = await asyncio.get_running_loop().run_in_executor(
+            None, render_winner_card, title, name, line1, line2
+        )
+        await channel.send(file=discord.File(buf, filename="winner.png"))
+    except Exception:
+        await channel.send(f"{title} — {name}\n{line1}\n{line2}")
+
+    await channel.send(
+        f"انتهت الجولة. جولة جديدة؟ صاحب الكلمة التالي: {next_keeper.mention}",
+        view=WordRematchView(channel, next_keeper),
+    )
+    await wordgame_cleanup(session)
+
+
+async def wordgame_cleanup(session):
+    session.phase = "done"
+    for task in (session.turn_task, session.answer_task):
+        if task:
+            task.cancel()
+    if session.lobby_view:
+        session.lobby_view.stop()
+    sessions.pop(session.channel.id, None)
+
+
 
 # ==============================
 # أمر فريرين
